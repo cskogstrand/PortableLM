@@ -627,14 +627,14 @@ if (Test-Path "$SDDir\sd.exe") {
 # STEP 6c: Download CyberRealistic Image Model
 # =================================================================
 Write-Host ""
-Write-Host "[6c/7] Downloading CyberRealistic Image Model (~1.99 GB)..." -ForegroundColor Yellow
-$ImageModelURL = "https://huggingface.co/cyberdelia/CyberRealistic/resolve/main/CyberRealistic_V3.3_FP16.safetensors"
-$ImageModelDest = "$USB_Drive\Shared\models\CyberRealistic_V3.3_FP16.safetensors"
+Write-Host "[6c/7] Downloading CyberRealistic Image Model (~2.13 GB)..." -ForegroundColor Yellow
+$ImageModelURL = "https://huggingface.co/cyberdelia/CyberRealistic/resolve/main/CyberRealistic_V9_FP16.safetensors"
+$ImageModelDest = "$USB_Drive\Shared\models\CyberRealistic_V9_FP16.safetensors"
 $ImageModelMinBytes = 2000000000
 
 if (Test-DownloadedFile -Path $ImageModelDest -MinSize $ImageModelMinBytes) {
     Write-Host "      CyberRealistic model already downloaded! Skipping..." -ForegroundColor Green
-} elseif (Copy-ModelFromDriveRoot -FileName "CyberRealistic_V3.3_FP16.safetensors" -DestPath $ImageModelDest -MinSize $ImageModelMinBytes) {
+} elseif (Copy-ModelFromDriveRoot -FileName "CyberRealistic_V9_FP16.safetensors" -DestPath $ImageModelDest -MinSize $ImageModelMinBytes) {
     # copied from drive root
 } else {
     Write-Host "      Downloading... This may take a while. Do NOT close this window!" -ForegroundColor Magenta
@@ -739,10 +739,10 @@ foreach ($m in $SelectedModels) {
     Write-Host $tag -ForegroundColor $tagColor
 }
 
-if (Test-Path "$USB_Drive\Shared\models\CyberRealistic_V3.3_FP16.safetensors") {
+if (Test-Path "$USB_Drive\Shared\models\CyberRealistic_V9_FP16.safetensors") {
     Write-Host ""
     Write-Host "  Installed Image model:" -ForegroundColor White
-    Write-Host "    - CyberRealistic v3.3 FP16 " -ForegroundColor Gray -NoNewline
+    Write-Host "    - CyberRealistic V9 FP16 " -ForegroundColor Gray -NoNewline
     Write-Host "[UNCENSORED]" -ForegroundColor Red
 }
 

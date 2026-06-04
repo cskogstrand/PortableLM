@@ -1837,6 +1837,71 @@
       .img-engine-btn.primary:hover {
         opacity: 0.92;
       }
+      .img-engine-btn.danger:hover {
+        background: rgba(244, 67, 54, 0.15);
+        color: var(--red);
+        border-color: rgba(244, 67, 54, 0.4);
+      }
+      .img-model-meta {
+        display: flex;
+        flex-direction: column;
+        gap: 2px;
+        min-width: 0;
+        flex: 1;
+      }
+      .img-model-badge {
+        font-size: 10.5px;
+        color: var(--t3);
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .img-model-size {
+        font-size: 12px;
+        color: var(--t3);
+        white-space: nowrap;
+        flex-shrink: 0;
+      }
+      .img-model-dl {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        flex: 1;
+        min-width: 120px;
+      }
+      .img-model-dl-track {
+        flex: 1;
+        height: 6px;
+        background: var(--bg3);
+        border-radius: 3px;
+        overflow: hidden;
+      }
+      .img-model-dl-fill {
+        height: 100%;
+        width: 0%;
+        background: linear-gradient(135deg, var(--grad1), var(--grad2));
+        border-radius: 3px;
+        transition: width 0.4s ease;
+      }
+      .img-model-dl-pct {
+        font-size: 11.5px;
+        color: var(--t3);
+        white-space: nowrap;
+      }
+      #img-model {
+        background: var(--bg2);
+        border: 1px solid var(--bd);
+        color: var(--t1);
+        border-radius: var(--radius);
+        padding: 9px 12px;
+        font-size: 13.5px;
+        font-family: var(--font);
+        outline: none;
+      }
+      #img-model:focus {
+        border-color: var(--bd2);
+        box-shadow: 0 0 0 3px rgba(66, 133, 244, 0.12);
+      }
       .img-row {
         display: flex;
         flex-direction: column;
@@ -2448,7 +2513,19 @@
               </div>
             </div>
 
+            <div class="img-engine-card" id="img-models-card">
+              <div class="img-engine-title">Image Models</div>
+              <div id="img-models-list">
+                <div class="img-engine-row"><span class="img-engine-status">Loading models...</span></div>
+              </div>
+            </div>
+
             <div class="img-warn" id="img-warn" style="display:none;"></div>
+
+            <div class="img-row">
+              <label>Model</label>
+              <select id="img-model"></select>
+            </div>
 
             <div class="img-row">
               <label>Prompt</label>
@@ -2584,6 +2661,8 @@
       abort: null,
       models: [],
       model: localStorage.getItem('g-model') || '',
+      imgModels: [],
+      imgModel: localStorage.getItem('g-img-model') || '',
       globalSys: '',
       logMode: localStorage.getItem('logMode') || 'errors_only',
       mode: 'chat', // 'chat' or 'image'
@@ -2636,6 +2715,8 @@
       tabChat: $('#tab-chat'),
       tabImage: $('#tab-image'),
       imgPanel: $('#img-panel'),
+      imgModel: $('#img-model'),
+      imgModelsList: $('#img-models-list'),
       imgPrompt: $('#img-prompt'),
       imgNeg: $('#img-neg'),
       imgSteps: $('#img-steps'),
@@ -2689,6 +2770,7 @@
         D.tabImage.addEventListener('click', () => switchMode('image'));
 
         pollHW();
+        loadImageModels();
         setInterval(pollHW, 5000);
         setInterval(fetchModels, 15000);
       }
@@ -2839,6 +2921,7 @@
         if (D.inpArea) D.inpArea.style.display = mode === 'chat' ? 'block' : 'none';
         if (mode === 'image') {
           updateEngineStatus();
+          loadImageModels();
         } else {
           // Reset image UI when leaving image mode
           D.imgProgress.style.display = 'none';
@@ -2917,6 +3000,202 @@
         return false;
       }
 
+      // ── Image Model Management ─────────────────────────────────
+      const IMG_RES = {
+        sd15: { opts: [256, 320, 384, 448, 512, 576, 640, 768], def: 512 },
+        sdxl: { opts: [512, 640, 768, 832, 896, 1024, 1152, 1280], def: 1024 },
+      };
+      const imgDlPolls = {}; // file -> interval id
+
+      function fmtBytes(b) {
+        if (!b) return '0 MB';
+        if (b >= 1e9) return (b / 1e9).toFixed(2) + ' GB';
+        return Math.round(b / 1e6) + ' MB';
+      }
+
+      function curImgModel() {
+        return S.imgModels.find((m) => m.file === S.imgModel) || null;
+      }
+
+      function updateImgResolutionOptions() {
+        const m = curImgModel();
+        const res = IMG_RES[m && m.type === 'sdxl' ? 'sdxl' : 'sd15'];
+        for (const sel of [D.imgWidth, D.imgHeight]) {
+          const prev = parseInt(sel.value, 10);
+          sel.innerHTML = res.opts
+            .map((v) => `<option value="${v}">${v}</option>`)
+            .join('');
+          sel.value = res.opts.includes(prev) ? String(prev) : String(res.def);
+        }
+      }
+
+      function renderImgModelSelect() {
+        const installed = S.imgModels.filter((m) => m.installed);
+        if (!installed.length) {
+          D.imgModel.innerHTML = '<option value="">No models installed</option>';
+          D.imgModel.disabled = true;
+          return;
+        }
+        D.imgModel.disabled = false;
+        if (!installed.some((m) => m.file === S.imgModel)) {
+          S.imgModel = installed[0].file;
+          localStorage.setItem('g-img-model', S.imgModel);
+        }
+        D.imgModel.innerHTML = installed
+          .map(
+            (m) =>
+              `<option value="${esc(m.file)}" ${m.file === S.imgModel ? 'selected' : ''}>${esc(m.name)} (${esc(m.size)})</option>`,
+          )
+          .join('');
+        updateImgResolutionOptions();
+      }
+
+      function renderImgModelsList() {
+        if (!S.imgModels.length) {
+          D.imgModelsList.innerHTML =
+            '<div class="img-engine-row"><span class="img-engine-status">Model catalog unavailable.</span></div>';
+          return;
+        }
+        D.imgModelsList.innerHTML = S.imgModels
+          .map((m) => {
+            let action;
+            if (m.downloading || imgDlPolls[m.file]) {
+              action = `<div class="img-model-dl" data-dl="${esc(m.file)}">
+                  <div class="img-model-dl-track"><div class="img-model-dl-fill"></div></div>
+                  <span class="img-model-dl-pct">...</span>
+                </div>`;
+            } else if (m.installed) {
+              action = `<span class="img-engine-status" style="margin-left:0">Installed</span>
+                <button class="img-engine-btn danger" data-del="${esc(m.file)}">Delete</button>`;
+            } else {
+              action = `<button class="img-engine-btn primary" data-get="${esc(m.file)}">Download</button>`;
+            }
+            return `<div class="img-engine-row">
+              <div class="img-engine-info">
+                <span class="img-engine-dot ${m.installed ? 'on' : 'off'}"></span>
+                <div class="img-model-meta">
+                  <span class="img-engine-name">${esc(m.name)}</span>
+                  <span class="img-model-badge">${esc(m.badge || '')}</span>
+                </div>
+              </div>
+              <span class="img-model-size">${esc(m.size)}</span>
+              ${action}
+            </div>`;
+          })
+          .join('');
+
+        D.imgModelsList.querySelectorAll('[data-get]').forEach((btn) =>
+          btn.addEventListener('click', () => downloadImgModel(btn.dataset.get)),
+        );
+        D.imgModelsList.querySelectorAll('[data-del]').forEach((btn) =>
+          btn.addEventListener('click', () => deleteImgModel(btn.dataset.del)),
+        );
+      }
+
+      async function loadImageModels() {
+        if (!IS_SERVED) return;
+        try {
+          const r = await fetch('/api/image-models');
+          if (!r.ok) return;
+          const d = await r.json();
+          S.imgModels = d.models || [];
+          renderImgModelSelect();
+          renderImgModelsList();
+          // Re-attach progress polling to downloads started before a page reload
+          for (const m of S.imgModels) {
+            if (m.downloading && m.download_job_id && !imgDlPolls[m.file]) {
+              pollImgDownload(m.file, m.download_job_id);
+            }
+          }
+        } catch {}
+      }
+
+      function pollImgDownload(file, jobId) {
+        if (imgDlPolls[file]) return;
+        imgDlPolls[file] = setInterval(async () => {
+          try {
+            const r = await fetch(`/api/download-progress?job_id=${encodeURIComponent(jobId)}`);
+            const d = await r.json();
+            if (!r.ok) return;
+            if (d.status === 'done') {
+              clearInterval(imgDlPolls[file]);
+              delete imgDlPolls[file];
+              toast(`Model downloaded: ${file}`);
+              await loadImageModels();
+              await updateEngineStatus();
+            } else if (d.status === 'error') {
+              clearInterval(imgDlPolls[file]);
+              delete imgDlPolls[file];
+              toast(`Download failed: ${d.error || 'Unknown error.'}`);
+              await loadImageModels();
+            } else {
+              const row = D.imgModelsList.querySelector(`[data-dl="${CSS.escape(file)}"]`);
+              if (row) {
+                const fill = row.querySelector('.img-model-dl-fill');
+                const pct = row.querySelector('.img-model-dl-pct');
+                if (d.bytes_total > 0) {
+                  const p = Math.min(100, Math.round((d.bytes_done / d.bytes_total) * 100));
+                  fill.style.width = `${p}%`;
+                  pct.textContent = `${p}% · ${fmtBytes(d.bytes_done)} / ${fmtBytes(d.bytes_total)}`;
+                } else {
+                  pct.textContent = fmtBytes(d.bytes_done);
+                }
+              }
+            }
+          } catch {}
+        }, 1000);
+      }
+
+      async function downloadImgModel(file) {
+        try {
+          const r = await fetch('/api/download-image-model', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ file }),
+          });
+          const d = await r.json();
+          if (!r.ok || d.error) {
+            toast(d.error || 'Failed to start download.');
+            return;
+          }
+          if (d.already_installed) {
+            await loadImageModels();
+            return;
+          }
+          renderImgModelsListWithDl(file);
+          pollImgDownload(file, d.job_id);
+        } catch (e) {
+          toast(`Network error: ${e.message || 'download failed.'}`);
+        }
+      }
+
+      function renderImgModelsListWithDl(file) {
+        const m = S.imgModels.find((x) => x.file === file);
+        if (m) m.downloading = true;
+        renderImgModelsList();
+      }
+
+      async function deleteImgModel(file) {
+        const m = S.imgModels.find((x) => x.file === file);
+        if (!confirm(`Delete ${m ? m.name : file}? This frees ${m ? m.size : ''} of disk space.`)) return;
+        try {
+          const r = await fetch('/api/delete-image-model', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ file }),
+          });
+          const d = await r.json();
+          if (!r.ok || d.error) {
+            toast(d.error || 'Failed to delete model.');
+            return;
+          }
+          toast('Model deleted.');
+          await loadImageModels();
+        } catch (e) {
+          toast(`Network error: ${e.message || 'delete failed.'}`);
+        }
+      }
+
       // ── Image Generation ───────────────────────────────────────
       function fmtMs(ms) {
         if (!ms || ms < 0) return '';
@@ -2981,7 +3260,7 @@
           { k: 'CFG Scale', v: p.cfg_scale || 7.0 },
           { k: 'Sampler', v: p.sampling_method || 'euler_a' },
           { k: 'Seed', v: p.seed ?? -1 },
-          { k: 'Model', v: 'CyberRealistic v3.3' },
+          { k: 'Model', v: p.model || 'Unknown' },
         ];
         if (p.negative_prompt) {
           rows.push({ k: 'Negative', v: p.negative_prompt });
@@ -3002,6 +3281,7 @@
 
         const payload = {
           prompt,
+          model: S.imgModel,
           negative_prompt: D.imgNeg.value.trim(),
           steps: parseInt(D.imgSteps.value, 10) || 20,
           cfg_scale: parseFloat(D.imgCfg.value) || 7.0,
@@ -3893,6 +4173,11 @@
         D.imgGenBtn.addEventListener('click', generateImage);
         D.imgStopOllama.addEventListener('click', stopChatEngine);
         D.imgStartOllama.addEventListener('click', startChatEngine);
+        D.imgModel.addEventListener('change', () => {
+          S.imgModel = D.imgModel.value;
+          localStorage.setItem('g-img-model', S.imgModel);
+          updateImgResolutionOptions();
+        });
 
         // Image lightbox bindings
         D.imgModalClose.addEventListener('click', closeImgModal);

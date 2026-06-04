@@ -28,6 +28,8 @@ import uuid
 import subprocess
 import base64
 import re
+import ssl
+import shutil
 from datetime import datetime
 from urllib.parse import urlparse, parse_qs
 
@@ -68,6 +70,40 @@ def _cleanup_old_image_jobs():
         for jid in stale:
             del IMAGE_JOBS[jid]
 
+# ── Image Model Download Job Tracking ──────────────────────────
+DOWNLOAD_JOBS = {}
+DOWNLOAD_JOBS_LOCK = threading.RLock()
+
+def _register_download_job(job_id, file_name):
+    with DOWNLOAD_JOBS_LOCK:
+        DOWNLOAD_JOBS[job_id] = {
+            "status": "starting",
+            "file": file_name,
+            "bytes_done": 0,
+            "bytes_total": 0,
+            "started_at": time.time(),
+            "updated_at": time.time(),
+            "error": None,
+        }
+
+def _update_download_job(job_id, **kwargs):
+    with DOWNLOAD_JOBS_LOCK:
+        if job_id in DOWNLOAD_JOBS:
+            DOWNLOAD_JOBS[job_id].update(kwargs)
+            DOWNLOAD_JOBS[job_id]["updated_at"] = time.time()
+
+def _get_download_job(job_id):
+    with DOWNLOAD_JOBS_LOCK:
+        return DOWNLOAD_JOBS.get(job_id, {}).copy()
+
+def _active_download_for_file(file_name):
+    """Return job_id of an in-flight download for this file, if any."""
+    with DOWNLOAD_JOBS_LOCK:
+        for jid, j in DOWNLOAD_JOBS.items():
+            if j.get("file") == file_name and j.get("status") in ("starting", "downloading"):
+                return jid
+    return None
+
 # Optional: psutil for hardware stats (graceful fallback to native APIs if not installed)
 try:
     import psutil
@@ -106,8 +142,45 @@ def _find_sd_binary():
     return None
 
 SD_BINARY = _find_sd_binary()
-SD_MODEL = os.path.join(SCRIPT_DIR, "models", "CyberRealistic_V3.3_FP16.safetensors")
-SD_ENABLED = SD_BINARY is not None and os.path.isfile(SD_MODEL)
+SD_MODELS_DIR = os.path.join(SCRIPT_DIR, "models")
+IMAGE_MODELS_CONFIG = os.path.join(SCRIPT_DIR, "config", "models.json")
+
+def _load_image_catalog():
+    """Read the image model catalog from the shared config JSON."""
+    try:
+        with open(IMAGE_MODELS_CONFIG, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("image_models", [])
+    except Exception:
+        return []
+
+def _image_model_installed(entry):
+    """True if a catalog entry's file exists locally and looks complete."""
+    path = os.path.join(SD_MODELS_DIR, entry.get("file", ""))
+    min_bytes = entry.get("min_bytes", 0) or 0
+    try:
+        return os.path.isfile(path) and os.path.getsize(path) >= min_bytes
+    except Exception:
+        return False
+
+def _installed_image_models():
+    """Catalog entries whose model file is present on disk."""
+    return [m for m in _load_image_catalog() if _image_model_installed(m)]
+
+def _resolve_image_model(file_name):
+    """Map a requested file name to an installed catalog entry (or default)."""
+    installed = _installed_image_models()
+    if not installed:
+        return None
+    if file_name:
+        for m in installed:
+            if m.get("file") == file_name:
+                return m
+    return installed[0]
+
+def _sd_enabled():
+    """Image generation is available when the engine and any model exist."""
+    return SD_BINARY is not None and len(_installed_image_models()) > 0
 
 def _test_sd_binary():
     """Test if the SD binary can actually execute (catches missing VC++ runtime on Windows)."""
@@ -510,20 +583,25 @@ def _run_sd_generation(job_id, payload, output_path):
     if not SD_BINARY or not os.path.isfile(SD_BINARY):
         _update_image_job(job_id, status="error", error="Stable Diffusion engine not found. Please run the installer.")
         return
-    if not os.path.isfile(SD_MODEL):
-        _update_image_job(job_id, status="error", error="Image model not found. Please run the installer to download CyberRealistic.")
+    model_entry = _resolve_image_model(payload.get("model", "").strip())
+    if not model_entry:
+        _update_image_job(job_id, status="error", error="No image model installed. Download one from the Models section.")
         return
+    model_path = os.path.join(SD_MODELS_DIR, model_entry["file"])
 
     prompt = payload.get("prompt", "").strip()
     if not prompt:
         _update_image_job(job_id, status="error", error="Prompt is required.")
         return
 
-    # Clamp parameters to safe ranges
+    # Clamp parameters to safe ranges (SDXL models support larger canvases)
+    is_sdxl = model_entry.get("type") == "sdxl"
+    max_dim = 1280 if is_sdxl else 768
+    default_dim = 1024 if is_sdxl else 512
     steps = max(1, min(50, _safe_int(payload.get("steps"), 20)))
     cfg = max(1.0, min(15.0, float(payload.get("cfg_scale", 7.0))))
-    width = max(256, min(768, _safe_int(payload.get("width"), 512)))
-    height = max(256, min(768, _safe_int(payload.get("height"), 512)))
+    width = max(256, min(max_dim, _safe_int(payload.get("width"), default_dim)))
+    height = max(256, min(max_dim, _safe_int(payload.get("height"), default_dim)))
     seed = _safe_int(payload.get("seed"), -1)
     negative = payload.get("negative_prompt", "").strip()
     sampling = payload.get("sampling_method", "euler_a")
@@ -532,7 +610,7 @@ def _run_sd_generation(job_id, payload, output_path):
 
     cmd = [
         SD_BINARY,
-        "-m", SD_MODEL,
+        "-m", model_path,
         "-p", prompt,
         "-o", output_path,
         "--steps", str(steps),
@@ -561,6 +639,8 @@ def _run_sd_generation(job_id, payload, output_path):
             "height": height,
             "seed": seed,
             "sampling_method": sampling,
+            "model": model_entry.get("name", model_entry["file"]),
+            "model_file": model_entry["file"],
         },
     )
 
@@ -611,6 +691,90 @@ def _run_sd_generation(job_id, payload, output_path):
             except Exception:
                 pass
         _update_image_job(job_id, status="error", error=str(e))
+
+def _open_model_url(url):
+    """Open an HTTPS URL, retrying with certifi CAs when the bundled Python
+    has no certificate store (common with python.org builds on macOS)."""
+    req = urllib.request.Request(url, headers={"User-Agent": "PortableLM/1.0"})
+    try:
+        return urllib.request.urlopen(req, timeout=60)
+    except urllib.error.URLError as e:
+        if not isinstance(getattr(e, "reason", None), ssl.SSLCertVerificationError):
+            raise
+    import certifi  # raises ImportError -> caller falls back to curl
+    ctx = ssl.create_default_context(cafile=certifi.where())
+    return urllib.request.urlopen(req, timeout=60, context=ctx)
+
+def _download_via_urllib(job_id, url, tmp):
+    """Stream a URL to tmp with progress updates. Returns bytes written."""
+    with _open_model_url(url) as resp:
+        total = int(resp.headers.get("Content-Length") or 0)
+        _update_download_job(job_id, status="downloading", bytes_total=total)
+        done = 0
+        last_update = 0.0
+        with open(tmp, "wb") as f:
+            while True:
+                chunk = resp.read(1024 * 1024)
+                if not chunk:
+                    break
+                f.write(chunk)
+                done += len(chunk)
+                now = time.time()
+                if now - last_update >= 0.5:
+                    _update_download_job(job_id, bytes_done=done)
+                    last_update = now
+    return done
+
+def _download_via_curl(job_id, entry, tmp):
+    """Fallback downloader using the system curl (uses the OS cert store).
+    Progress is tracked by polling the partial file size."""
+    curl = shutil.which("curl")
+    if not curl:
+        raise RuntimeError("Download failed: no usable TLS certificates and curl is not available.")
+    # Content-Length is unknown here; estimate from the catalog size (GB)
+    try:
+        est_total = int(float(entry.get("size", 0)) * 1e9)
+    except Exception:
+        est_total = 0
+    _update_download_job(job_id, status="downloading", bytes_total=est_total)
+    proc = subprocess.Popen(
+        [curl, "-L", "--fail", "-sS", "-o", tmp, entry["url"]],
+        stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+    )
+    while proc.poll() is None:
+        try:
+            _update_download_job(job_id, bytes_done=os.path.getsize(tmp))
+        except OSError:
+            pass
+        time.sleep(0.5)
+    if proc.returncode != 0:
+        err = proc.stderr.read().decode("utf-8", errors="ignore").strip()
+        raise RuntimeError(f"curl download failed: {err or 'exit code ' + str(proc.returncode)}")
+    return os.path.getsize(tmp)
+
+def _run_model_download(job_id, entry):
+    """Download a catalog image model to the models dir with progress tracking."""
+    dest = os.path.join(SD_MODELS_DIR, entry["file"])
+    tmp = dest + ".part"
+    url = entry.get("url", "")
+    min_bytes = entry.get("min_bytes", 0) or 0
+    try:
+        os.makedirs(SD_MODELS_DIR, exist_ok=True)
+        try:
+            done = _download_via_urllib(job_id, url, tmp)
+        except (urllib.error.URLError, ImportError, ssl.SSLError):
+            # TLS trouble (missing CA store) -> retry with system curl
+            done = _download_via_curl(job_id, entry, tmp)
+        if min_bytes and done < min_bytes:
+            raise RuntimeError("Download incomplete: file smaller than expected.")
+        os.replace(tmp, dest)
+        _update_download_job(job_id, status="done", bytes_done=done, bytes_total=done)
+    except Exception as e:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        _update_download_job(job_id, status="error", error=str(e))
 
 class LogFormatter(logging.Formatter):
     """Readable, multi-line formatter with strict spacing and rich context."""
@@ -812,6 +976,10 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         elif path == "/api/image-progress":
             self._get_image_progress()
 
+        # Image model download progress API
+        elif path == "/api/download-progress":
+            self._get_download_progress()
+
         # Proxy Ollama API
         elif path.startswith("/ollama/"):
             self._proxy_ollama("GET")
@@ -832,6 +1000,13 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         # Image generation API
         elif path == "/api/generate-image":
             self._generate_image()
+
+        # Image model management APIs
+        elif path == "/api/download-image-model":
+            self._download_image_model()
+
+        elif path == "/api/delete-image-model":
+            self._delete_image_model()
 
         # Engine control APIs
         elif path == "/api/stop-ollama":
@@ -1010,18 +1185,24 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
 
     # ── Image Generation API ───────────────────────────────────
     def _get_image_models(self):
-        """Return the available image generation model(s)."""
+        """Return the full image model catalog with install status."""
         models = []
-        if SD_ENABLED:
+        for m in _load_image_catalog():
+            file_name = m.get("file", "")
+            dl_job = _active_download_for_file(file_name)
             models.append({
-                "name": "CyberRealistic v3.3 FP16",
-                "local": "cyberrealistic-local",
-                "file": "CyberRealistic_V3.3_FP16.safetensors",
-                "size": "1.99 GB",
-                "label": "UNCENSORED",
-                "badge": "SD 1.5 - CYBER REALISTIC",
+                "name": m.get("name", file_name),
+                "local": m.get("local", ""),
+                "file": file_name,
+                "size": f"{m.get('size', '?')} GB",
+                "label": m.get("label", ""),
+                "badge": m.get("badge", ""),
+                "type": m.get("type", "sd15"),
+                "installed": _image_model_installed(m),
+                "downloading": dl_job is not None,
+                "download_job_id": dl_job,
             })
-        data = json.dumps({"models": models, "sd_enabled": SD_ENABLED})
+        data = json.dumps({"models": models, "sd_enabled": _sd_enabled()})
         self.send_response(200)
         self.send_header("Content-Type", "application/json")
         self._cors_headers()
@@ -1033,9 +1214,9 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         ollama_up = _is_ollama_running()
         data = json.dumps({
             "ollama": ollama_up,
-            "sd_enabled": SD_ENABLED,
+            "sd_enabled": _sd_enabled(),
             "sd_binary": bool(SD_BINARY),
-            "sd_model": bool(os.path.isfile(SD_MODEL)) if SD_MODEL else False,
+            "sd_model": len(_installed_image_models()) > 0,
             "sd_healthy": _test_sd_binary(),
         })
         self.send_response(200)
@@ -1099,7 +1280,7 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         except Exception:
             payload = {}
 
-        if not SD_ENABLED:
+        if not _sd_enabled():
             self.send_response(503)
             self.send_header("Content-Type", "application/json")
             self._cors_headers()
@@ -1187,6 +1368,97 @@ class ChatHandler(http.server.BaseHTTPRequestHandler):
         self._cors_headers()
         self.end_headers()
         self.wfile.write(json.dumps(resp).encode())
+
+    def _send_json(self, status_code, obj):
+        """Send a JSON response with CORS headers."""
+        self.send_response(status_code)
+        self.send_header("Content-Type", "application/json")
+        self._cors_headers()
+        self.end_headers()
+        self.wfile.write(json.dumps(obj).encode())
+
+    def _download_image_model(self):
+        """Start downloading a catalog image model. Returns a job_id."""
+        request_context = self._build_request_context("/api/download-image-model")
+        body = self._read_body()
+        try:
+            payload = json.loads(body) if body else {}
+        except Exception:
+            payload = {}
+        file_name = (payload.get("file") or "").strip()
+
+        # Only files declared in the catalog may be downloaded (no arbitrary URLs)
+        entry = next((m for m in _load_image_catalog() if m.get("file") == file_name), None)
+        if not entry:
+            self._send_json(400, {"error": "Unknown image model."})
+            return
+        if _image_model_installed(entry):
+            self._send_json(200, {"ok": True, "already_installed": True})
+            return
+
+        existing = _active_download_for_file(file_name)
+        if existing:
+            self._send_json(200, {"ok": True, "job_id": existing})
+            return
+
+        job_id = str(uuid.uuid4())
+        _register_download_job(job_id, file_name)
+        thread = threading.Thread(target=_run_model_download, args=(job_id, entry), daemon=True)
+        thread.start()
+
+        _log_event(logging.INFO, f"Image model download started: {file_name}", request_context=request_context)
+        self._send_json(200, {"ok": True, "job_id": job_id})
+
+    def _get_download_progress(self):
+        """Poll endpoint for image model download progress."""
+        query = parse_qs(urlparse(self.path).query)
+        job_id = query.get("job_id", [None])[0]
+        if not job_id:
+            self._send_json(400, {"error": "Missing job_id parameter."})
+            return
+        job = _get_download_job(job_id)
+        if not job:
+            self._send_json(404, {"error": "Job not found."})
+            return
+        resp = {
+            "status": job.get("status"),
+            "file": job.get("file"),
+            "bytes_done": job.get("bytes_done", 0),
+            "bytes_total": job.get("bytes_total", 0),
+        }
+        if job.get("status") == "error":
+            resp["error"] = job.get("error", "Unknown error.")
+        self._send_json(200, resp)
+
+    def _delete_image_model(self):
+        """Delete an installed catalog image model to free disk space."""
+        request_context = self._build_request_context("/api/delete-image-model")
+        body = self._read_body()
+        try:
+            payload = json.loads(body) if body else {}
+        except Exception:
+            payload = {}
+        file_name = (payload.get("file") or "").strip()
+
+        # Only catalog-listed files may be deleted (prevents path traversal)
+        entry = next((m for m in _load_image_catalog() if m.get("file") == file_name), None)
+        if not entry:
+            self._send_json(400, {"error": "Unknown image model."})
+            return
+        if _active_download_for_file(file_name):
+            self._send_json(409, {"error": "Model is currently downloading."})
+            return
+        path = os.path.join(SD_MODELS_DIR, file_name)
+        if not os.path.isfile(path):
+            self._send_json(404, {"error": "Model is not installed."})
+            return
+        try:
+            os.remove(path)
+            _log_event(logging.INFO, f"Image model deleted: {file_name}", request_context=request_context)
+            self._send_json(200, {"ok": True})
+        except Exception as e:
+            _log_event(logging.ERROR, f"Failed to delete image model: {file_name}", request_context=request_context, exc_info=True)
+            self._send_json(500, {"error": str(e)})
 
     # ── Ollama Proxy (streaming-aware) ─────────────────────────
     def _proxy_ollama(self, method):

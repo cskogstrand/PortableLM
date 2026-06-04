@@ -585,14 +585,14 @@ fi
 # STEP 6c: Download CyberRealistic Image Model
 # ================================================================
 echo ""
-echo -e "${YLW}[6c/7] Downloading CyberRealistic Image Model (~1.99 GB)...${RST}"
+echo -e "${YLW}[6c/7] Downloading CyberRealistic Image Model (~2.13 GB)...${RST}"
 
-IMAGE_MODEL="$MODELS_DIR/CyberRealistic_V3.3_FP16.safetensors"
-IMAGE_URL="https://huggingface.co/cyberdelia/CyberRealistic/resolve/main/CyberRealistic_V3.3_FP16.safetensors"
+IMAGE_MODEL="$MODELS_DIR/CyberRealistic_V9_FP16.safetensors"
+IMAGE_URL="https://huggingface.co/cyberdelia/CyberRealistic/resolve/main/CyberRealistic_V9_FP16.safetensors"
 
 if file_ok "$IMAGE_MODEL" 2000000000; then
     echo -e "${GRN}      CyberRealistic model already downloaded! Skipping...${RST}"
-elif copy_from_drive_root "CyberRealistic_V3.3_FP16.safetensors" "$IMAGE_MODEL" 2000000000; then
+elif copy_from_drive_root "CyberRealistic_V9_FP16.safetensors" "$IMAGE_MODEL" 2000000000; then
     :
 else
     echo -e "      Downloading... This may take a while. Do NOT close this window!"
@@ -714,7 +714,7 @@ fi
 if file_ok "$IMAGE_MODEL" 2000000000; then
     echo ""
     echo -e "${WHT}  Installed Image model:${RST}"
-    echo -e "${GRY}    - CyberRealistic v3.3 FP16 ${RED}[UNCENSORED]${RST}"
+    echo -e "${GRY}    - CyberRealistic V9 FP16 ${RED}[UNCENSORED]${RST}"
 fi
 
 echo ""
